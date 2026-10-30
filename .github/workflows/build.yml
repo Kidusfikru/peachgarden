@@ -1,0 +1,206 @@
+name: Build Multi-Platform Apps (Electron & Android)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+  # Workflow changes are excluded by paths-ignore, so use workflow_dispatch to run CI after editing this file.
+  workflow_dispatch:
+
+jobs:
+  # 1. Build the Electron client
+  build-electron:
+    name: Build Electron (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Cache Electron Builder
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: electron-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            electron-${{ runner.os }}-
+
+      - name: Build Electron
+        run: |
+          bun install
+          bun run build:electron --${{ matrix.platform }} --publish never
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Upload the ZIP artifact.
+      - name: Upload Electron package
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-${{ matrix.platform }}
+          path: |
+            pkg/*.zip
+
+  # 2. Build the Android APK
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # The action also installs the discontinued legacy "tools" package by default.
+          # Install only platform-tools; Gradle downloads the remaining components as needed.
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+
+      # Use the official Gradle Action with built-in caching.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Build frontend
+        run: |
+          bun install
+          bun run build
+
+      - name: Sync Capacitor
+        run: bunx cap sync android
+
+      - name: Build APK (Release)
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --build-cache
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: android/app/build/outputs/apk/release/*.apk
+
+  # 3. Package the web build from docs for self-hosting.
+  build-web:
+    name: Package Web Build (docs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Build frontend
+        run: |
+          bun install
+          bun run build
+
+      - name: Archive docs directory
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          # Archive the contents of docs so index.html and assets/ are at the archive root.
+          (cd docs && zip -r "../taoyuan-${VERSION}-web.zip" .)
+          ls -la taoyuan-*-web.zip
+          unzip -l taoyuan-*-web.zip | head -8
+
+      - name: Upload web archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-docs
+          path: taoyuan-*-web.zip
+
+  # 4. Publish a GitHub Release
+  release:
+    needs: [build-electron, build-android, build-web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get version
+        id: get_version
+        run: echo "VERSION=v$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+      # Download artifacts separately to avoid filename collisions.
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./raw-assets
+
+      # Move files into a flat directory before publishing.
+      - name: Organize release artifacts
+        run: |
+          mkdir -p ./final-release
+
+          # Move the Electron ZIP package.
+          find ./raw-assets/electron-* -type f -name "*.zip" -exec cp {} ./final-release/ \;
+
+          # Move the Android APK.
+          find ./raw-assets/android-apk -type f -name "*.apk" -exec cp {} ./final-release/ \; || true
+
+          # Move the web archive.
+          find ./raw-assets/web-docs -type f -name "*.zip" -exec cp {} ./final-release/ \; || true
+
+          # List the release assets.
+          echo "Final assets to upload:"
+          ls -R ./final-release
+
+      # 3. Remove existing assets from the release, if present.
+      - name: Delete existing release assets
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          # List and delete all assets attached to the release.
+          gh release view "$VERSION" --json assets -q '.assets[].name' 2>/dev/null | while read -r asset; do
+            echo "Deleting asset: $asset"
+            gh release delete-asset "$VERSION" "$asset" -y || true
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      # 4. Upload the new files.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.VERSION }}
+          name: Release ${{ steps.get_version.outputs.VERSION }}
+          files: ./final-release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

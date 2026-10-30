@@ -1,0 +1,7 @@
+# CI build-specific dockerignore
+# Keep only docs/ and nginx.conf, exclude all other files
+
+*
+
+!docs/
+!nginx.conf
