@@ -15,12 +15,6 @@ This project is based on [setube/taoyuan](https://github.com/setube/taoyuan). Th
 - Procedurally generated music and sound effects
 - Web, desktop (Electron), and Android builds
 
-## Screenshots
-
-![Gameplay screenshot](images/1.png)
-
-![Gameplay screenshot](images/2.png)
-
 ## Getting started
 
 ### Requirements
